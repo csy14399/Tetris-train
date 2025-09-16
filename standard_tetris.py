@@ -14,6 +14,18 @@ import sys
 import random
 import pygame
 
+# 优先使用包含箭头和扩展字符的字体，避免文字显示为方框
+FONT_PREFERENCE = [
+    "Microsoft YaHei",
+    "Microsoft YaHei UI",
+    "Segoe UI Symbol",
+    "Arial Unicode MS",
+    "WenQuanYi Micro Hei",
+    "DejaVu Sans",
+    "SimHei",
+    "Arial",
+]
+
 # === 配置 ===
 COLS, ROWS = 10, 20        # 棋盘尺寸
 CELL = 32                  # 方块像素尺寸
@@ -332,7 +344,7 @@ def draw_cell(surface, px, py, color):
     pygame.draw.rect(surface, OUTLINE, rect, 1)
 
 
-def draw_panel(surface, game, panel_rect, fonts):
+def draw_panel(surface, game, panel_rect, fonts, hint_lines):
     x0, y0, w, h = panel_rect
     title = fonts['big'].render("TETRIS", True, TEXT)
     surface.blit(title, (x0, y0))
@@ -364,15 +376,6 @@ def draw_panel(surface, game, panel_rect, fonts):
         y += 90
 
     # 底部提示
-    hint_lines = [
-        "←/→: Move",
-        "↓: Soft Drop",
-        "↑/X: Rotate CW",
-        "Z: Rotate CCW",
-        "Space: Hard Drop",
-        "C: Hold",
-        "P: Pause  R: Restart",
-    ]
     y = panel_rect[1] + panel_rect[3] - 18 * len(hint_lines) - 10
     for s in hint_lines:
         t = fonts['tiny'].render(s, True, (140, 140, 150))
@@ -411,13 +414,51 @@ def draw_mino_box(surface, x, y, kind, fonts):
         pygame.draw.rect(surface, OUTLINE, rect, 1)
 
 
+def font_supports_text(font, text):
+    """检查字体是否支持文本中的所有字符（避免渲染出方框）。"""
+    try:
+        metrics = font.metrics(text)
+    except ValueError:
+        # 某些 Pygame 版本在空字符串时会抛错，这里宽容处理
+        return False
+    return all(m is not None for m in metrics)
+
+
+def choose_hint_lines(font):
+    """优先使用带箭头的提示，若字体不支持则退回 ASCII 文本。"""
+    candidates = [
+        ("←/→: Move", "Left/Right: Move"),
+        ("↓: Soft Drop", "Down: Soft Drop"),
+        ("↑/X: Rotate CW", "Up/X: Rotate CW"),
+        ("Z: Rotate CCW", None),
+        ("Space: Hard Drop", None),
+        ("C: Hold", None),
+        ("P: Pause  R: Restart", None),
+    ]
+
+    lines = []
+    for preferred, fallback in candidates:
+        if font_supports_text(font, preferred):
+            lines.append(preferred)
+        elif fallback is not None:
+            lines.append(fallback)
+        else:
+            lines.append(preferred)
+    return lines
+
+
+def load_font(size, bold=False):
+    return pygame.font.SysFont(FONT_PREFERENCE, size, bold=bold)
+
+
 def main():
     pygame.init()
     pygame.display.set_caption("Tetris (本地)")
-    font_big = pygame.font.SysFont(None, 36)
-    font_small = pygame.font.SysFont(None, 24)
-    font_tiny = pygame.font.SysFont(None, 18)
+    font_big = load_font(36)
+    font_small = load_font(24)
+    font_tiny = load_font(18)
     fonts = {'big': font_big, 'small': font_small, 'tiny': font_tiny}
+    hint_lines = choose_hint_lines(font_tiny)
 
     screen_w = MARGIN + COLS * CELL + 20 + SIDE_W + MARGIN
     screen_h = MARGIN + ROWS * CELL + MARGIN
@@ -495,7 +536,7 @@ def main():
         # --- 绘制 ---
         screen.fill(BG)
         draw_board(screen, game, board_rect, fonts)
-        draw_panel(screen, game, panel_rect, fonts)
+        draw_panel(screen, game, panel_rect, fonts, hint_lines)
 
         # 暂停/结束遮罩
         if game.paused and not game.game_over:
