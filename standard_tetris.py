@@ -94,6 +94,210 @@ def lighten(color, factor=0.35):
     return tuple(min(255, int(c + (255 - c) * factor)) for c in color)
 
 
+def clone_board(board):
+    return [row[:] for row in board]
+
+
+def clear_lines_from_board(board):
+    new_rows = []
+    cleared = 0
+    for row in board:
+        if all(cell is not None for cell in row):
+            cleared += 1
+        else:
+            new_rows.append(row[:])
+    for _ in range(cleared):
+        new_rows.insert(0, [None for _ in range(COLS)])
+    return new_rows, cleared
+
+
+def valid_position_on_board(board, coords, ox, oy):
+    for (cx, cy) in coords:
+        x, y = ox + cx, oy + cy
+        if x < 0 or x >= COLS or y >= ROWS:
+            return False
+        if y >= 0 and board[y][x] is not None:
+            return False
+    return True
+
+
+def drop_y_for_coords(board, coords, x):
+    y = -4
+    while valid_position_on_board(board, coords, x, y + 1):
+        y += 1
+    if not valid_position_on_board(board, coords, x, y):
+        return None
+    return y
+
+
+def evaluate_board_metrics(board):
+    heights = [0 for _ in range(COLS)]
+    holes = 0
+    bumpiness = 0
+    aggregate_height = 0
+    for x in range(COLS):
+        column_height = 0
+        block_found = False
+        column_holes = 0
+        for y in range(ROWS):
+            if board[y][x] is not None:
+                if not block_found:
+                    block_found = True
+                    column_height = ROWS - y
+            else:
+                if block_found:
+                    column_holes += 1
+        heights[x] = column_height
+        aggregate_height += column_height
+        holes += column_holes
+    for x in range(COLS - 1):
+        bumpiness += abs(heights[x] - heights[x + 1])
+    well_sum = 0
+    for x in range(COLS):
+        left = heights[x - 1] if x > 0 else heights[x]
+        right = heights[x + 1] if x < COLS - 1 else heights[x]
+        if heights[x] < left and heights[x] < right:
+            well_sum += min(left, right) - heights[x]
+    return {
+        'aggregate_height': aggregate_height,
+        'holes': holes,
+        'bumpiness': bumpiness,
+        'well_sum': well_sum,
+        'max_height': max(heights) if heights else 0,
+        'heights': heights,
+    }
+
+
+def score_position(metrics, lines_cleared, top_out):
+    score = (
+        -0.510066 * metrics['aggregate_height']
+        + 0.760666 * lines_cleared
+        - 0.35663 * metrics['holes']
+        - 0.184483 * metrics['bumpiness']
+        + 0.1 * metrics['well_sum']
+    )
+    if top_out:
+        score -= 10
+    return score
+
+
+def simulate_lock_result(board, kind, rot, x, y):
+    if kind == 'O':
+        coords = SHAPES['O']
+    else:
+        coords = rotate_coords(SHAPES[kind], rot)
+    board_copy = clone_board(board)
+    top_out = False
+    for (cx, cy) in coords:
+        gx, gy = x + cx, y + cy
+        if gy < 0:
+            top_out = True
+            continue
+        board_copy[gy][gx] = COLORS[kind]
+    cleared = 0
+    final_board = board_copy
+    if not top_out:
+        final_board, cleared = clear_lines_from_board(board_copy)
+    metrics = evaluate_board_metrics(final_board)
+    score = score_position(metrics, cleared, top_out)
+    return {
+        'board_after': final_board,
+        'lines_cleared': cleared,
+        'top_out': top_out,
+        'metrics': metrics,
+        'score': score,
+        'cells': [(x + cx, y + cy) for (cx, cy) in coords],
+        'rot': rot,
+        'x': x,
+        'y': y,
+    }
+
+
+def evaluate_piece_moves(board, kind):
+    best = None
+    seen = set()
+    for rot in range(4):
+        if kind == 'O' and rot > 0:
+            continue
+        if kind == 'O':
+            coords = SHAPES['O']
+        else:
+            coords = rotate_coords(SHAPES[kind], rot)
+        key = tuple(sorted(coords))
+        if key in seen:
+            continue
+        seen.add(key)
+        minx = min(cx for (cx, _) in coords)
+        maxx = max(cx for (cx, _) in coords)
+        for x in range(-minx, COLS - maxx):
+            drop_y = drop_y_for_coords(board, coords, x)
+            if drop_y is None:
+                continue
+            result = simulate_lock_result(board, kind, rot, x, drop_y)
+            if best is None or result['score'] > best['score']:
+                best = result
+    return best
+
+
+def enrich_move_result(result, *, used_hold, source, piece_kind):
+    if result is None:
+        return None
+    enriched = {}
+    for key, value in result.items():
+        if key == 'cells':
+            enriched[key] = list(value)
+        elif key == 'board_after':
+            enriched[key] = clone_board(value)
+        elif key == 'metrics':
+            metrics_copy = dict(value)
+            if 'heights' in value:
+                metrics_copy['heights'] = list(value['heights'])
+            enriched[key] = metrics_copy
+        else:
+            enriched[key] = value
+    enriched['used_hold'] = used_hold
+    enriched['source'] = source
+    enriched['piece_kind'] = piece_kind
+    return enriched
+
+
+def find_best_moves(board, current_kind, hold_available, hold_kind, queue):
+    current_best = enrich_move_result(
+        evaluate_piece_moves(board, current_kind),
+        used_hold=False,
+        source='current',
+        piece_kind=current_kind,
+    )
+
+    hold_best = None
+    if hold_available:
+        target_kind = None
+        source = None
+        if hold_kind:
+            target_kind = hold_kind
+            source = 'hold'
+        elif queue:
+            target_kind = queue[0]
+            source = 'queue'
+        if target_kind:
+            hold_best = enrich_move_result(
+                evaluate_piece_moves(board, target_kind),
+                used_hold=True,
+                source=source,
+                piece_kind=target_kind,
+            )
+
+    overall = current_best
+    if hold_best and (overall is None or hold_best['score'] > overall['score']):
+        overall = hold_best
+
+    return {
+        'current': current_best,
+        'hold': hold_best,
+        'overall': overall,
+    }
+
+
 class Tetromino:
     def __init__(self, kind):
         self.kind = kind
@@ -154,6 +358,9 @@ class Game:
 
         self.hold_kind = None
         self.hold_used = False
+        self.turn_hold_used = False
+
+        self.history = []
 
         self.fall_ms = self.calc_fall_ms()
         self.timer_ms = 0
@@ -231,38 +438,95 @@ class Game:
         # 锁定延迟由主循环计时推进
 
     def lock_piece(self):
-        """将当前块固定到棋盘，判行、加分、出新块"""
+        """将当前块固定到棋盘，判行、加分、出新块并记录复盘信息"""
         p = self.current
-        # 若有格子在可视上方（y<0）即锁定则 Game Over
-        for (x, y) in p.cells():
-            if y < 0:
-                self.game_over = True
-                return
-        # 写入棋盘
-        for (x, y) in p.cells():
-            if 0 <= y < ROWS:
-                self.board[y][x] = p.color
+        board_before = clone_board(self.board)
+        queue_before = list(self.queue)
+        hold_before = self.hold_kind
+        hold_available = not self.turn_hold_used
+        hold_used_in_turn = self.turn_hold_used
 
-        # 统计消行
-        cleared = self.clear_lines()
-        if cleared > 0:
-            self.lines += cleared
-            self.score += LINE_SCORES.get(cleared, 0) * self.level
-            # 升级
-            new_level = 1 + self.lines // 10
-            if new_level != self.level:
-                self.level = new_level
-                self.fall_ms = self.calc_fall_ms()
+        player_eval = simulate_lock_result(board_before, p.kind, p.rot, p.x, p.y)
+        player_eval_record = dict(player_eval)
+        player_eval_record['cells'] = list(player_eval['cells'])
+        player_eval_record['board_after'] = clone_board(player_eval['board_after'])
+        metrics_copy = dict(player_eval['metrics'])
+        if 'heights' in player_eval['metrics']:
+            metrics_copy['heights'] = list(player_eval['metrics']['heights'])
+        player_eval_record['metrics'] = metrics_copy
+        player_eval_record['piece_kind'] = p.kind
 
-        # 新块
-        self.current = Tetromino(self.queue.pop(0))
-        self.rand.refill_queue(self.queue)
-        self.hold_used = False
-        self.lock_timer = None
+        best_moves = find_best_moves(board_before, p.kind, hold_available, hold_before, queue_before)
+        best_overall = best_moves['overall']
+        diff_vs_best = None
+        if best_overall is not None:
+            diff_vs_best = player_eval_record['score'] - best_overall['score']
 
-        # 刚生成就冲突 => Game Over
-        if not self.valid(self.current.cells()):
+        score_before = self.score
+        lines_before = self.lines
+        level_before = self.level
+
+        top_out = player_eval_record['top_out']
+        spawn_blocked = False
+        cleared = player_eval_record['lines_cleared']
+
+        if top_out:
             self.game_over = True
+            board_after_actual = clone_board(self.board)
+        else:
+            board_after_actual = clone_board(player_eval_record['board_after'])
+            self.board = board_after_actual
+            if cleared > 0:
+                self.lines += cleared
+                self.score += LINE_SCORES.get(cleared, 0) * self.level
+                new_level = 1 + self.lines // 10
+                if new_level != self.level:
+                    self.level = new_level
+                    self.fall_ms = self.calc_fall_ms()
+
+            self.current = Tetromino(self.queue.pop(0))
+            self.rand.refill_queue(self.queue)
+            self.hold_used = False
+            self.turn_hold_used = False
+            self.lock_timer = None
+
+            if not self.valid(self.current.cells()):
+                self.game_over = True
+                spawn_blocked = True
+
+        score_after = self.score
+        lines_after = self.lines
+        queue_after = list(self.queue)
+
+        entry = {
+            'board_before': board_before,
+            'board_after_actual': clone_board(self.board),
+            'player_eval': player_eval_record,
+            'best_overall': best_overall,
+            'best_current': best_moves['current'],
+            'best_hold': best_moves['hold'],
+            'score_diff_to_best': diff_vs_best,
+            'score_before': score_before,
+            'score_after': score_after,
+            'score_gain': score_after - score_before,
+            'lines_before': lines_before,
+            'lines_after': lines_after,
+            'level_before': level_before,
+            'level_after': self.level,
+            'hold_kind_before': hold_before,
+            'hold_kind_after': self.hold_kind,
+            'hold_available': hold_available,
+            'hold_used_this_turn': hold_used_in_turn,
+            'queue_before': queue_before,
+            'queue_after': queue_after,
+            'cleared': cleared,
+            'game_over_after': self.game_over,
+            'game_over_reason': 'top_out' if top_out else ('spawn_block' if spawn_blocked else None),
+        }
+        self.history.append(entry)
+
+        if top_out:
+            return
 
     def clear_lines(self):
         new_rows = []
@@ -289,6 +553,7 @@ class Game:
             self.current = Tetromino(self.hold_kind)
             self.hold_kind = cur_kind
         self.hold_used = True
+        self.turn_hold_used = True
 
     # --- 渲染辅助 ---
     def ghost_cells(self):
@@ -414,6 +679,222 @@ def draw_mino_box(surface, x, y, kind, fonts):
         pygame.draw.rect(surface, OUTLINE, rect, 1)
 
 
+def cells_equal(a, b):
+    return set(tuple(c) for c in a) == set(tuple(c) for c in b)
+
+
+class ReviewSession:
+    def __init__(self, history):
+        self.history = history or []
+        self.index = max(0, len(self.history) - 1)
+        self.view_best = False
+        self.active = bool(self.history)
+
+    def current_entry(self):
+        if not self.history:
+            return None
+        return self.history[self.index]
+
+    def step(self, delta):
+        if not self.history:
+            return
+        self.index = max(0, min(self.index + delta, len(self.history) - 1))
+
+    def toggle_view(self):
+        self.view_best = not self.view_best
+
+    def total_steps(self):
+        return len(self.history)
+
+    def is_player_best(self):
+        entry = self.current_entry()
+        if not entry:
+            return True
+        best = entry['best_overall']
+        if not best:
+            return True
+        player = entry['player_eval']
+        if best['piece_kind'] != player['piece_kind']:
+            return False
+        return cells_equal(best['cells'], player['cells'])
+
+
+def draw_overlay(surface, board_rect, cells, color, *, fill=True, outline=True, fill_alpha=140, outline_width=2):
+    if not cells:
+        return
+    x0, y0, _, _ = board_rect
+    if fill:
+        fill_color = lighten(color, 0.4)
+        fill_surf = pygame.Surface((CELL - 2, CELL - 2), pygame.SRCALPHA)
+        fill_surf.fill((*fill_color, fill_alpha))
+    else:
+        fill_surf = None
+    outline_color = lighten(color, 0.15)
+    for (x, y) in cells:
+        if y < 0 or y >= ROWS:
+            continue
+        px = x0 + x * CELL
+        py = y0 + y * CELL
+        rect = pygame.Rect(px + 1, py + 1, CELL - 2, CELL - 2)
+        if fill and fill_surf is not None:
+            surface.blit(fill_surf, rect.topleft)
+        if outline:
+            pygame.draw.rect(surface, outline_color, rect, outline_width)
+
+
+def draw_review_board(surface, board_rect, review, fonts):
+    x0, y0, w, h = board_rect
+    pygame.draw.rect(surface, BOARD_BG, (x0, y0, w, h))
+    for i in range(COLS + 1):
+        x = x0 + i * CELL
+        pygame.draw.line(surface, GRID_LINE, (x, y0), (x, y0 + ROWS * CELL))
+    for j in range(ROWS + 1):
+        y = y0 + j * CELL
+        pygame.draw.line(surface, GRID_LINE, (x0, y), (x0 + COLS * CELL, y))
+
+    entry = review.current_entry() if review else None
+    board = entry['board_before'] if entry else [[None for _ in range(COLS)] for _ in range(ROWS)]
+
+    for y in range(ROWS):
+        for x in range(COLS):
+            color = board[y][x]
+            if color:
+                draw_cell(surface, x0 + x * CELL, y0 + y * CELL, color)
+
+    if entry:
+        player_move = entry['player_eval']
+        best_move = entry['best_overall']
+        if review.view_best and best_move:
+            best_color = COLORS[best_move['piece_kind']]
+            draw_overlay(surface, board_rect, best_move['cells'], best_color, fill=True, outline=True)
+            if not cells_equal(best_move['cells'], player_move['cells']) or best_move['piece_kind'] != player_move['piece_kind']:
+                player_color = COLORS[player_move['piece_kind']]
+                draw_overlay(surface, board_rect, player_move['cells'], player_color, fill=False, outline=True, outline_width=1)
+        else:
+            player_color = COLORS[player_move['piece_kind']]
+            draw_overlay(surface, board_rect, player_move['cells'], player_color, fill=True, outline=True)
+            if best_move and (best_move['piece_kind'] != player_move['piece_kind'] or not cells_equal(best_move['cells'], player_move['cells'])):
+                best_color = COLORS[best_move['piece_kind']]
+                draw_overlay(surface, board_rect, best_move['cells'], best_color, fill=False, outline=True, outline_width=2)
+
+    pygame.draw.rect(surface, OUTLINE, (x0, y0, w, h), 2)
+
+    label = "最优落点" if review and review.view_best else "玩家落点"
+    if review and review.view_best and (not entry or entry['best_overall'] is None):
+        label += "（无）"
+    label_surf = fonts['small'].render(label, True, ACCENT)
+    surface.blit(label_surf, (x0 + 8, y0 + 6))
+
+    if entry and entry['score_diff_to_best'] is not None:
+        diff = entry['score_diff_to_best']
+        if diff < -2:
+            diff_color = (255, 120, 120)
+        elif diff < -0.5:
+            diff_color = (255, 200, 120)
+        elif diff > 0.5:
+            diff_color = (120, 220, 140)
+        else:
+            diff_color = TEXT
+        diff_text = f"差距: {diff:+.2f}"
+        diff_surf = fonts['tiny'].render(diff_text, True, diff_color)
+        surface.blit(diff_surf, (x0 + 8, y0 + 6 + label_surf.get_height() + 4))
+
+
+def draw_review_panel(surface, panel_rect, fonts, review):
+    x0, y0, w, h = panel_rect
+    pygame.draw.rect(surface, (26, 26, 30), (x0, y0, w, h))
+    pygame.draw.rect(surface, OUTLINE, (x0, y0, w, h), 2)
+
+    entry = review.current_entry() if review else None
+    if not entry:
+        text = fonts['small'].render("暂无复盘数据", True, TEXT)
+        surface.blit(text, (x0 + 12, y0 + 12))
+        return
+
+    def write(line, font_key='small', color=TEXT, spacing=26):
+        nonlocal y
+        surf = fonts[font_key].render(line, True, color)
+        surface.blit(surf, (x0 + 12, y))
+        y += spacing
+
+    y = y0 + 14
+    write("复盘模式", 'big', ACCENT, 42)
+    step_text = f"第 {review.index + 1}/{review.total_steps()} 手"
+    write(step_text)
+    view_text = "展示：最优" if review.view_best else "展示：玩家"
+    write(view_text, 'tiny', ACCENT, 20)
+
+    player_eval = entry['player_eval']
+    piece_kind = player_eval['piece_kind']
+    write(f"方块：{piece_kind}")
+
+    hold_before = entry['hold_kind_before'] or '空'
+    hold_status = '已用' if entry['hold_used_this_turn'] else '可用'
+    write(f"Hold 槽：{hold_before}（{hold_status}）", 'tiny', ACCENT, 20)
+    next_hint = entry['queue_before'][0] if entry['queue_before'] else '-'
+    write(f"Next：{next_hint}", 'tiny', ACCENT, 22)
+
+    write(f"实际得分变化：{entry['score_gain']}")
+    write(f"玩家估值：{player_eval['score']:.2f}，消行：{player_eval['lines_cleared']}")
+
+    best_move = entry['best_overall']
+    if best_move:
+        best_desc = "最优："
+        if best_move['used_hold']:
+            if best_move['source'] == 'hold':
+                best_desc += f"Hold → {best_move['piece_kind']}"
+            else:
+                best_desc += f"Hold 换出 {best_move['piece_kind']}"
+        else:
+            best_desc += f"直接放置 {best_move['piece_kind']}"
+        write(best_desc)
+        write(f"最优估值：{best_move['score']:.2f}，消行：{best_move['lines_cleared']}")
+    else:
+        write("最优估值：无可行落点", 'small', (255, 150, 150))
+
+    diff = entry['score_diff_to_best']
+    if diff is not None:
+        if diff < -2:
+            comment = "评语：严重失误，需要重点反思"
+            color = (255, 120, 120)
+        elif diff < -0.5:
+            comment = "评语：尚可，但仍有改进空间"
+            color = (255, 200, 120)
+        elif diff > 0.5:
+            comment = "评语：表现优秀，超过基准"
+            color = (140, 220, 140)
+        else:
+            comment = "评语：选择稳健"
+            color = (200, 200, 220)
+        write(f"与最优差距：{diff:+.2f}")
+        write(comment, 'tiny', color, 24)
+    else:
+        write("与最优差距：--", 'tiny', ACCENT, 24)
+
+    player_metrics = player_eval['metrics']
+    write("玩家指标：", 'small', ACCENT, 24)
+    write(f"高度和：{player_metrics['aggregate_height']:.0f}", 'tiny', TEXT, 20)
+    write(f"洞数：{player_metrics['holes']}", 'tiny', TEXT, 20)
+    write(f"起伏：{player_metrics['bumpiness']:.1f}", 'tiny', TEXT, 24)
+
+    if best_move and 'metrics' in best_move:
+        best_metrics = best_move['metrics']
+        write("最优指标：", 'small', ACCENT, 24)
+        write(f"高度和：{best_metrics['aggregate_height']:.0f}", 'tiny', TEXT, 20)
+        write(f"洞数：{best_metrics['holes']}", 'tiny', TEXT, 20)
+        write(f"起伏：{best_metrics['bumpiness']:.1f}", 'tiny', TEXT, 24)
+
+    if entry['game_over_reason'] == 'top_out':
+        write("结果：本手顶出导致结束", 'small', (255, 140, 140), 28)
+    elif entry['game_over_reason'] == 'spawn_block':
+        write("结果：下一块无法生成，游戏结束", 'small', (255, 140, 140), 28)
+
+    y = max(y + 6, y0 + h - 90)
+    write("操作提示：", 'small', ACCENT, 24)
+    write("←/→：切换手数", 'tiny', TEXT, 20)
+    write("Tab：切换玩家/最优展示", 'tiny', TEXT, 20)
+    write("Enter：退出复盘   R：重新开始", 'tiny', TEXT, 20)
+
 def font_supports_text(font, text):
     """检查字体是否支持文本中的所有字符（避免渲染出方框）。"""
     try:
@@ -470,6 +951,7 @@ def main():
     panel_rect = (MARGIN + COLS * CELL + 20, MARGIN, SIDE_W, ROWS * CELL)
 
     game = Game()
+    review = None
 
     running = True
     while running:
@@ -481,10 +963,31 @@ def main():
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
+                    continue
+
+                if review and review.active:
+                    if event.key == pygame.K_LEFT:
+                        review.step(-1)
+                    elif event.key == pygame.K_RIGHT:
+                        review.step(1)
+                    elif event.key == pygame.K_TAB:
+                        review.toggle_view()
+                    elif event.key in (pygame.K_RETURN, pygame.K_v):
+                        review.active = False
+                    elif event.key == pygame.K_r:
+                        game = Game()
+                        review = None
+                    continue
+
                 if game.game_over:
                     if event.key == pygame.K_r:
                         game = Game()
+                        review = None
+                    elif event.key in (pygame.K_RETURN, pygame.K_v):
+                        if game.history:
+                            review = ReviewSession(game.history)
                     continue
+
                 if event.key == pygame.K_LEFT:
                     game.move(-1, 0)
                 elif event.key == pygame.K_RIGHT:
@@ -501,6 +1004,7 @@ def main():
                     game.paused = not game.paused
                 elif event.key == pygame.K_r:
                     game = Game()
+                    review = None
                 elif event.key == pygame.K_DOWN:
                     game.down_pressed = True
 
@@ -509,7 +1013,7 @@ def main():
                     game.down_pressed = False
 
         # --- 更新 ---
-        if not game.game_over and not game.paused:
+        if not game.game_over and not game.paused and not (review and review.active):
             # 计算当前重力间隔
             fall_ms = game.fall_ms
             accelerated = False
@@ -535,25 +1039,31 @@ def main():
 
         # --- 绘制 ---
         screen.fill(BG)
-        draw_board(screen, game, board_rect, fonts)
-        draw_panel(screen, game, panel_rect, fonts, hint_lines)
 
-        # 暂停/结束遮罩
-        if game.paused and not game.game_over:
-            overlay = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
-            overlay.fill((0, 0, 0, 120))
-            screen.blit(overlay, (0, 0))
-            t = fonts['big'].render("PAUSED", True, TEXT)
-            screen.blit(t, (screen_w // 2 - t.get_width() // 2, screen_h // 2 - 24))
+        if review and review.active:
+            draw_review_board(screen, board_rect, review, fonts)
+            draw_review_panel(screen, panel_rect, fonts, review)
+        else:
+            draw_board(screen, game, board_rect, fonts)
+            draw_panel(screen, game, panel_rect, fonts, hint_lines)
 
-        if game.game_over:
-            overlay = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
-            overlay.fill((0, 0, 0, 140))
-            screen.blit(overlay, (0, 0))
-            a = fonts['big'].render("GAME OVER", True, TEXT)
-            b = fonts['small'].render("Press R to Restart", True, TEXT)
-            screen.blit(a, (screen_w // 2 - a.get_width() // 2, screen_h // 2 - 40))
-            screen.blit(b, (screen_w // 2 - b.get_width() // 2, screen_h // 2))
+            if game.paused and not game.game_over:
+                overlay = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 120))
+                screen.blit(overlay, (0, 0))
+                t = fonts['big'].render("PAUSED", True, TEXT)
+                screen.blit(t, (screen_w // 2 - t.get_width() // 2, screen_h // 2 - 24))
+
+            if game.game_over:
+                overlay = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 140))
+                screen.blit(overlay, (0, 0))
+                a = fonts['big'].render("GAME OVER", True, TEXT)
+                b = fonts['small'].render("Press R to Restart", True, TEXT)
+                c = fonts['small'].render("Press Enter to Review", True, TEXT)
+                screen.blit(a, (screen_w // 2 - a.get_width() // 2, screen_h // 2 - 60))
+                screen.blit(b, (screen_w // 2 - b.get_width() // 2, screen_h // 2 - 12))
+                screen.blit(c, (screen_w // 2 - c.get_width() // 2, screen_h // 2 + 28))
 
         pygame.display.flip()
 
